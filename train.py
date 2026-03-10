@@ -264,7 +264,7 @@ class GPT(nn.Module):
 #
 # The agent must define:
 #   create_optimizer(model) -> optimizer
-#   step_optimizer(optimizer, model, step, progress) -> None
+#   step_optimizer(optimizer, model, step, progress) -> lrm (float, for logging)
 #
 # The training loop (FIXED, below) calls these two functions.
 # ===========================================================================

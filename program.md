@@ -23,14 +23,18 @@ Once you get confirmation, kick off the experimentation.
 **What you CAN do:**
 - Modify `train.py` ONLY between `# ===== OPTIMIZER START =====` and `# ===== OPTIMIZER END =====`
 - Within that section: change optimizer class, hyperparameters, LR schedules, gradient manipulation, add custom optimizer implementations, etc.
-- You MUST preserve the function signatures: `create_optimizer(model) -> optimizer` and `step_optimizer(optimizer, model, step, progress) -> lrm`
-- You may add imports at the top of the optimizer section
+- You may add `import` statements at the top of the optimizer section (only stdlib and torch — no external packages)
+- Implement custom optimizer classes from scratch within the section
 
 **What you CANNOT do:**
 - Modify anything outside the OPTIMIZER START/END markers in `train.py`
 - Modify `prepare.py` — it is read-only
 - Change the model architecture, training loop, batch size, model size, or evaluation
-- Install new packages or add dependencies
+- Install new packages or add dependencies — everything must use only stdlib + torch
+
+**Required function signatures** (the training loop calls these):
+- `create_optimizer(model) -> optimizer` — build and return the optimizer
+- `step_optimizer(optimizer, model, step, progress) -> lrm` — apply schedules, step, zero grads, return a float `lrm` (LR multiplier, used for logging)
 
 **The goal is simple: get the lowest val_bpb.** The model, data, and time budget are identical across all experiments — only the optimizer varies.
 
@@ -38,7 +42,33 @@ Once you get confirmation, kick off the experimentation.
 
 **Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Conversely, removing something and getting equal or better results is a simplification win.
 
-**The first run**: Your very first run should always be to establish the MuonAdamW baseline, so run the training script as-is.
+**The first run**: Your very first run should always be to establish the baseline, so run the training script as-is.
+
+## Understanding the Baseline
+
+The default optimizer is **MuonAdamW** — this is NOT basic Muon. It's an already highly-tuned setup:
+
+**Parameter groups** (the model has 6 types of parameters):
+- `model.lm_head` — unembedding matrix → AdamW
+- `model.transformer.wte` — token embeddings → AdamW
+- `model.value_embeds` — value embeddings (ResFormer) → AdamW
+- `model.resid_lambdas` — per-layer residual scalars → AdamW
+- `model.x0_lambdas` — per-layer skip connection scalars → AdamW
+- `model.transformer.h` — all 2D transformer matrices (attention Q/K/V/proj, MLP) → Muon
+
+**Muon features already in the baseline:**
+- Newton-Schulz orthogonalization (5 iterations, "polar express" coefficients)
+- Nesterov momentum with warmup (0.85 → 0.95 over 300 steps)
+- NorMuon variance reduction (second momentum buffer, beta2=0.95)
+- Cautious updates (only update where gradient aligns with parameter direction)
+- Weight decay linearly decayed to 0
+
+**Schedules already in the baseline:**
+- No warmup, 50% warmdown (linear to 0)
+- LR scaling: `1/sqrt(model_dim/768)` for AdamW groups
+- Muon LR additionally scaled by `sqrt(max(1, rows/cols))` per weight shape
+
+This means naive changes like "add warmup" or "try cosine decay" may or may not help — the baseline is already sophisticated. Read the code carefully before experimenting.
 
 ## Output format
 
@@ -145,13 +175,14 @@ Add gradient-level modifications within the optimizer:
 - Gradient normalization per-layer
 
 ### Phase 5: Alternative Optimizers
-Replace Muon entirely or modify its core:
-- SOAP (spectral optimizer)
-- Shampoo (preconditioned)
-- Lion (sign-based, very memory efficient)
-- Prodigy (learning-rate-free)
+Replace Muon entirely or modify its core (must implement from scratch using only torch):
+- SOAP (spectral optimizer — related to Muon, uses SVD/eigendecomposition)
+- Shampoo (preconditioned — maintain row/col preconditioners)
+- Lion (sign-based — very simple, just sign of momentum)
+- Prodigy (learning-rate-free — adapts LR automatically)
 - LAMB/LARS for the matrix params
-- Pure AdamW with aggressive tuning
+- Pure AdamW with aggressive tuning (is Muon actually helping here?)
+- Use the existing MuonAdamW class as a template for the param group structure
 
 ### Phase 6: Novel Combinations
 Combine the best findings:
@@ -170,4 +201,7 @@ Combine the best findings:
 - `create_optimizer` gives you control over param groups, optimizer class, and initial config
 - Weight decay, LR, and momentum schedules interact — change one at a time
 - The 5-minute budget means every optimization step counts — avoid adding expensive per-step computation
+- The fused optimizer functions use `@torch.compile(dynamic=False, fullgraph=True)` — if you modify them, avoid Python-level data-dependent control flow (use `torch.where` instead of `if`). Or remove `@torch.compile` if needed (slower but more flexible)
+- Alternative optimizers (SOAP, Lion, Shampoo, etc.) must be implemented from scratch — you cannot install external packages. Use the existing MuonAdamW as a template
+- `step_optimizer` must return a float `lrm` — the training loop uses it for logging. If your optimizer doesn't have a simple LR multiplier, return 1.0
 - Record every experiment, even failures — they contain information
