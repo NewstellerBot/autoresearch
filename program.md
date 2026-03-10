@@ -141,67 +141,66 @@ LOOP FOREVER:
 
 ## Research Directions
 
-### Phase 1: Baselines and Hyperparameter Tuning
-Start by understanding the current MuonAdamW baseline, then tune:
-- Muon learning rate (try 0.02, 0.03, 0.06, 0.08)
-- AdamW learning rates for embeddings/unembeddings
-- Weight decay values and schedules
-- Adam betas
-- Warmup/warmdown ratios
+### Phase 1: Establish Baseline (2-3 experiments max, then move on)
+- Run the default MuonAdamW as-is to get a reference val_bpb
+- Try 1-2 quick hyperparameter tweaks (Muon LR, warmup ratio) to confirm the baseline is near-optimal
+- Do NOT spend more than a few experiments here — the baseline is already well-tuned
 
-### Phase 2: Learning Rate Scheduling
-Experiment with different schedules:
-- Add warmup (try 0.05, 0.1, 0.2 warmup ratios)
-- Cosine decay instead of linear warmdown
-- Different warmdown ratios
-- OneCycleLR-style schedule
-- Final LR fraction (try 0.01 instead of 0.0)
+### Phase 2: Quasi-Newton Methods
+The core research direction. Quasi-Newton methods approximate second-order curvature without computing the full Hessian. The key question: can we beat Muon's orthogonalization with curvature-aware updates?
 
-### Phase 3: Muon Internals
-The Muon optimizer has several components that can be individually tuned or replaced:
-- Newton-Schulz iteration count (try 3, 4, 6, 7)
-- Newton-Schulz coefficients (the polar_express_coeffs)
-- Momentum warmup schedule (currently 0.85->0.95 over 300 steps)
-- NorMuon variance reduction (try disabling it, or tuning beta2)
-- Cautious updates mask (try removing it, or different thresholds)
-- Weight decay integration (decoupled vs coupled, schedule shape)
+Ideas to try:
+- **Online L-BFGS**: Maintain a limited-memory BFGS approximation using recent gradient pairs (s, y vectors). Apply the two-loop recursion to compute H*g cheaply. Key challenge: stochastic gradients make curvature estimates noisy — try damped updates, skip updates when curvature estimate is bad (y^T s < threshold)
+- **Structured quasi-Newton for matrices**: Exploit the 2D structure of weight matrices. Maintain separate row-space and column-space curvature approximations (Kronecker-factored L-BFGS). This is much cheaper than full L-BFGS for large matrices
+- **Diagonal quasi-Newton**: Approximate the Hessian as diagonal only — essentially an adaptive per-parameter learning rate learned from curvature. Simpler than full L-BFGS, might work well with Muon's orthogonalization on top
+- **L-BFGS + Muon hybrid**: Use L-BFGS curvature to precondition gradients, THEN apply Muon's orthogonalization. Or vice versa: orthogonalize first, then apply curvature correction
+- **SR1 (Symmetric Rank-1) updates**: Alternative to BFGS that allows indefinite Hessian approximations — may work better for non-convex landscapes. Cheaper per-step than BFGS
+- **Online Newton with sketching**: Use random sketching (count sketch, random projection) to maintain a compressed Hessian approximation that fits in memory
 
-### Phase 4: Gradient Manipulation
-Add gradient-level modifications within the optimizer:
-- Gradient clipping (norm or value-based)
-- Gradient noise injection (decaying with step)
-- Gradient centralization
-- Layer-wise LR scaling (LARS/LAMB-style)
-- Gradient normalization per-layer
+### Phase 3: Curvature-Aware Preconditioning
+Methods that use second-order information without full quasi-Newton machinery:
 
-### Phase 5: Alternative Optimizers
-Replace Muon entirely or modify its core (must implement from scratch using only torch):
-- SOAP (spectral optimizer — related to Muon, uses SVD/eigendecomposition)
-- Shampoo (preconditioned — maintain row/col preconditioners)
-- Lion (sign-based — very simple, just sign of momentum)
-- Prodigy (learning-rate-free — adapts LR automatically)
-- LAMB/LARS for the matrix params
-- Pure AdamW with aggressive tuning (is Muon actually helping here?)
-- Use the existing MuonAdamW class as a template for the param group structure
+- **K-FAC (Kronecker-Factored Approximate Curvature)**: Approximate the Fisher information matrix as a Kronecker product of layer input/output statistics. Very natural for linear layers — maintain running averages of A = E[a*a^T] and G = E[g*g^T], precondition as G^{-1} * grad * A^{-1}
+- **Shampoo**: Maintain left and right preconditioners L, R for each weight matrix W. Update rule: W -= lr * L^{-1/p} @ grad @ R^{-1/p}. Periodically recompute L, R from gradient outer products. Try different recomputation intervals
+- **Natural gradient via diagonal Fisher**: Approximate Fisher as diagonal — just the running average of squared gradients (like Adam's v), but use it as a true preconditioner rather than element-wise scaling
+- **Layer-wise adaptive preconditioning**: Learn a scalar or low-rank preconditioner per layer based on gradient statistics. Cheaper than K-FAC but captures inter-layer curvature differences
 
-### Phase 6: Novel Combinations
-Combine the best findings:
-- Best optimizer + best schedule
-- Lookahead wrapper around Muon
-- Stochastic Weight Averaging
-- EMA of parameters
-- Different optimizers for different layer depths
-- Hybrid schedules (e.g., warmup + cosine for AdamW, different schedule for Muon)
+### Phase 4: Novel Gradient Transformations
+Go beyond Muon's orthogonalization — invent new ways to transform gradients before applying them:
+
+- **Spectral gradient reshaping**: Compute SVD of the gradient (or approximate via power iteration), then reshape the singular value spectrum. Muon makes all singular values equal (orthogonalization). What if you keep relative magnitudes but compress the spectrum? Or boost small singular values more?
+- **Gradient whitening**: Decorrelate gradient components using a running estimate of the gradient covariance. Different from Adam (which only tracks diagonal variance)
+- **Polar decomposition variants**: Muon approximates the polar factor U of G = U*S. What about using U*f(S) for some nonlinear f? Or using only the top-k singular components?
+- **Hyperbolic gradient transformations**: Apply hyperbolic tangent or other nonlinearities to gradient components to handle heavy-tailed gradient distributions
+- **Momentum on the manifold**: Instead of Euclidean momentum (linear interpolation of gradients), try momentum that respects the geometry of the parameter space — e.g., transport previous momentum to current tangent space before combining
+
+### Phase 5: Adaptive and Meta-Learning Approaches
+Methods that learn to optimize during training:
+
+- **Hypergradient descent**: Compute the gradient of the loss w.r.t. the learning rate itself (using the chain rule through the optimizer step). Use this to adapt LR online. Can also adapt momentum, weight decay
+- **Per-layer learned LR**: Instead of a single schedule, learn a separate LR multiplier per layer (or per param group) that adapts based on gradient statistics
+- **Loss-aware updates**: Scale updates based on recent loss trajectory — be more aggressive when loss is decreasing steadily, more conservative near plateaus or after loss spikes
+- **Dual averaging / mirror descent**: Use a different geometry for the optimization space — e.g., entropy-regularized updates that naturally keep parameters from growing too large
+
+### Phase 6: Hybrid and Frontier Approaches
+Combine the best findings with creative architecture-aware optimization:
+
+- **Best quasi-Newton + Muon orthogonalization**: If a curvature method helps, combine it with the best gradient transformation
+- **Cascaded preconditioning**: Apply multiple preconditioning steps in sequence (e.g., K-FAC → spectral reshaping → momentum)
+- **Attention-aware optimization**: Different optimization strategies for attention weights vs MLP weights (they have very different loss landscapes)
+- **Progressive optimizer switching**: Start with one optimizer (e.g., Adam for stability), switch to a more aggressive one (e.g., quasi-Newton) after warmup
+- **Population-based schedule search**: Try random perturbations to the schedule/hyperparameters each run, keep improvements (effectively doing meta-optimization across experiments)
 
 ## Tips
 
-- The baseline MuonAdamW is already highly tuned — small improvements matter
-- Muon handles the 2D matrix parameters, AdamW handles embeddings/scalars — this split is important
+- All custom optimizers must be implemented from scratch using only stdlib + torch — no external packages
+- Use the existing MuonAdamW class as a template for the param group structure (Muon for 2D matrices, AdamW for embeddings/scalars)
 - The `step_optimizer` function gives you full control over per-step logic (scheduling, gradient manipulation, etc.)
 - `create_optimizer` gives you control over param groups, optimizer class, and initial config
-- Weight decay, LR, and momentum schedules interact — change one at a time
-- The 5-minute budget means every optimization step counts — avoid adding expensive per-step computation
 - The fused optimizer functions use `@torch.compile(dynamic=False, fullgraph=True)` — if you modify them, avoid Python-level data-dependent control flow (use `torch.where` instead of `if`). Or remove `@torch.compile` if needed (slower but more flexible)
-- Alternative optimizers (SOAP, Lion, Shampoo, etc.) must be implemented from scratch — you cannot install external packages. Use the existing MuonAdamW as a template
 - `step_optimizer` must return a float `lrm` — the training loop uses it for logging. If your optimizer doesn't have a simple LR multiplier, return 1.0
-- Record every experiment, even failures — they contain information
+- The 5-minute budget means per-step overhead matters. Quasi-Newton methods that do O(n^2) work per step may be too slow for large layers — use low-rank or sketched approximations. Profile if unsure
+- For quasi-Newton: the memory budget is ~24GB total. Budget optimizer state carefully — L-BFGS with history size m stores 2m vectors per parameter group
+- SVD and eigendecomposition are available via `torch.linalg.svd`, `torch.linalg.eigh` etc. For approximate/truncated SVD, use power iteration (`torch.svd_lowrank`)
+- When implementing novel methods, start simple (e.g., diagonal approximation), verify it doesn't crash or diverge, then add complexity
+- Record every experiment, even failures — a method that diverges tells you something about the loss landscape
